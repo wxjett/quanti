@@ -113,7 +113,7 @@ class TushareAdapter:
     def _code_to_ts_code(code: str) -> str:
         if code.startswith("6"):
             return f"{code}.SH"
-        if code.startswith(("4", "8")):
+        if code.startswith(("4", "8", "920")):
             return f"{code}.BJ"
         return f"{code}.SZ"
 

@@ -135,6 +135,57 @@ def test_code_ts_code_mapping():
     assert TushareAdapter._ts_code_to_code("830799.BJ") == ("830799", "BJ")
 
 
+@pytest.mark.parametrize(
+    ("code", "exchange"),
+    [
+        ("600519", "SH"),
+        ("000001", "SZ"),
+        ("300750", "SZ"),
+        ("430047", "BJ"),
+        ("830799", "BJ"),
+        ("920000", "BJ"),
+        ("920002", "BJ"),
+        ("920992", "BJ"),
+    ],
+)
+def test_single_stock_sync_uses_correct_exchange_and_saves_quotes(
+    db, code, exchange
+):
+    from unittest.mock import Mock
+
+    db.upsert_stock(code, "测试股票", exchange, date(2024, 1, 1), "")
+    pro = Mock()
+    pro.daily.return_value = pd.DataFrame([{
+        "ts_code": f"{code}.{exchange}",
+        "trade_date": "20260930",
+        "open": 50.0,
+        "high": 53.0,
+        "low": 49.0,
+        "close": 51.94,
+        "pre_close": 50.0,
+        "vol": 19680.31,
+        "amount": 100000.0,
+    }])
+    adapter = TushareAdapter(db, pro=pro)
+
+    saved = adapter.sync_daily_quotes(
+        code, start=date(2026, 9, 1), end=date(2026, 9, 30),
+        with_basic=False,
+    )
+
+    pro.daily.assert_called_once_with(
+        ts_code=f"{code}.{exchange}",
+        start_date="20260901",
+        end_date="20260930",
+    )
+    pro.daily_basic.assert_not_called()
+    assert saved == 1
+    out = db.get_daily_quotes(code, date(2026, 9, 1), date(2026, 9, 30))
+    assert len(out) == 1
+    assert out.iloc[0]["close"] == pytest.approx(51.94)
+    assert db.get_quote_source(code) == "tushare"
+
+
 def test_units_normalized_and_source_tagged(db):
     """vol(手)→股 ×100, amount(千元)→元 ×1000, and source='tushare' (P2)."""
     db.upsert_stock("600001", "x", "SH", date(1998, 1, 22), "")
