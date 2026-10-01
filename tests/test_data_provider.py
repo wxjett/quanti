@@ -165,13 +165,23 @@ class TestPriceAdjustment:
 
 
 class TestAkShareAdapter:
+    @patch("quanti.data.akshare_adapter.AkShareAdapter._fetch_sh_stock_list")
     @patch("quanti.data.akshare_adapter.ak")
-    def test_fetch_stock_list_survivorship_free(self, mock_ak, db):
+    def test_fetch_stock_list_survivorship_free(self, mock_ak, mock_sh, db):
         """akshare roster: SH/SZ/BJ listed + SH/SZ delisted, with real list_date
         and delist_date — survivorship-free, no tushare."""
         from datetime import date as _d
-        mock_ak.stock_info_sh_name_code.return_value = pd.DataFrame([
-            {"证券代码": "600519", "证券简称": "贵州茅台", "上市日期": _d(2001, 8, 27)}])
+        sh_frames = {
+            "主板A股": pd.DataFrame([{
+                "证券代码": "600519", "证券简称": "贵州茅台",
+                "上市日期": _d(2001, 8, 27), "所属行业": "C 制造业",
+            }]),
+            "科创板": pd.DataFrame([{
+                "证券代码": "688001", "证券简称": "华兴源创",
+                "上市日期": _d(2019, 7, 22), "所属行业": "C 制造业",
+            }]),
+        }
+        mock_sh.side_effect = lambda symbol: sh_frames[symbol].copy()
         mock_ak.stock_info_sz_name_code.return_value = pd.DataFrame([
             {"A股代码": "000001", "A股简称": "平安银行",
              "A股上市日期": "1991-04-03", "所属行业": "J 金融业"}])
@@ -186,8 +196,8 @@ class TestAkShareAdapter:
              "上市日期": _d(1991, 1, 14), "终止上市日期": _d(2002, 6, 14)}])
 
         n = AkShareAdapter(db).sync_stock_list()
-        assert n == 5
-        assert len(db.list_stocks()) == 5
+        assert n == 6
+        assert len(db.list_stocks()) == 6
         # real list_date parsed (string + date forms)
         assert db.get_stock("000001").list_date == _d(1991, 4, 3)
         assert db.get_stock("920000").exchange == "BJ"          # 北交所
@@ -195,6 +205,14 @@ class TestAkShareAdapter:
         sh_del = db.get_stock("600001")
         assert sh_del.delist_date == _d(2009, 12, 29)
         assert db.get_stock("000003").delist_date == _d(2002, 6, 14)
+
+        assert db.get_stock("600519").industry == "C 制造业"
+        assert db.get_stock("688001").exchange == "SH"
+        assert db.get_stock("688001").industry == "C 制造业"
+        sh_frames["主板A股"].loc[0, "证券简称"] = "更新名称"
+        assert AkShareAdapter(db).sync_stock_list() == 6
+        assert len(db.list_stocks()) == 6
+        assert db.get_stock("600519").name == "更新名称"
 
     @patch("quanti.data.akshare_adapter.ak")
     def test_adj_factor_from_raw_and_hfq(self, mock_ak, db):

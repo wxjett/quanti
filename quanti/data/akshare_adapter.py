@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 
 import akshare as ak
+import httpx
 import pandas as pd
 
 from quanti.data.database import Database
@@ -143,18 +144,63 @@ class AkShareAdapter:
 
         self._db.upsert_stock(code, name, exchange, list_date, industry)
 
-    # Survivorship-free roster from akshare (FREE, no token) — listed (SH/SZ/BJ)
-    # + delisted (SH/SZ), each carrying a REAL list_date. Replaces the tushare
-    # stock_basic path, which on a low-points token is rate-limited to ~1/hour.
-    # (endpoint, code col, name col, list_date col, delist_date col, exchange,
-    #  industry col); None = column absent. Delist sources LAST so delist_date wins.
+    # Listed SH main board + STAR + SZ + BJ, then historical delist records.
+    # Shanghai uses the same SSE source as AkShare, retaining its CSRC fields.
     _ROSTER_SOURCES = (
-        ("stock_info_sh_name_code", "证券代码", "证券简称", "上市日期", None, "SH", None),
-        ("stock_info_sz_name_code", "A股代码", "A股简称", "A股上市日期", None, "SZ", "所属行业"),
-        ("stock_info_bj_name_code", "证券代码", "证券简称", "上市日期", None, "BJ", "所属行业"),
-        ("stock_info_sh_delist", "公司代码", "公司简称", "上市日期", "暂停上市日期", "SH", None),
-        ("stock_info_sz_delist", "证券代码", "证券简称", "上市日期", "终止上市日期", "SZ", None),
+        ("stock_info_sh_name_code", {"symbol": "主板A股"}, "证券代码", "证券简称",
+         "上市日期", None, "SH", "所属行业"),
+        ("stock_info_sh_name_code", {"symbol": "科创板"}, "证券代码", "证券简称",
+         "上市日期", None, "SH", "所属行业"),
+        ("stock_info_sz_name_code", {}, "A股代码", "A股简称",
+         "A股上市日期", None, "SZ", "所属行业"),
+        ("stock_info_bj_name_code", {}, "证券代码", "证券简称",
+         "上市日期", None, "BJ", "所属行业"),
+        ("stock_info_sh_delist", {}, "公司代码", "公司简称",
+         "上市日期", "暂停上市日期", "SH", None),
+        ("stock_info_sz_delist", {}, "证券代码", "证券简称",
+         "上市日期", "终止上市日期", "SZ", None),
     )
+
+    @staticmethod
+    def _fetch_sh_stock_list(symbol: str) -> pd.DataFrame:
+        """Preserve industries omitted by AkShare's SSE name/code wrapper."""
+        stock_type = {"主板A股": "1", "科创板": "8"}[symbol]
+        response = httpx.get(
+            "https://query.sse.com.cn/sseQuery/commonQuery.do",
+            params={
+                "STOCK_TYPE": stock_type, "REG_PROVINCE": "", "CSRC_CODE": "",
+                "STOCK_CODE": "", "sqlId": "COMMON_SSE_CP_GPJCTPZ_GPLB_GP_L",
+                "COMPANY_STATUS": "2,4,5,7,8", "type": "inParams",
+                "isPagination": "true", "pageHelp.cacheSize": "1",
+                "pageHelp.beginPage": "1", "pageHelp.pageSize": "10000",
+                "pageHelp.pageNo": "1", "pageHelp.endPage": "1",
+            },
+            headers={
+                "Referer": "https://www.sse.com.cn/assortment/stock/list/share/",
+                "User-Agent": "Mozilla/5.0",
+            },
+            timeout=20.0,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        raw = pd.DataFrame(payload["result"])
+        required = {"A_STOCK_CODE", "SEC_NAME_CN", "LIST_DATE",
+                    "CSRC_CODE", "CSRC_CODE_DESC"}
+        if raw.empty or not required.issubset(raw.columns):
+            raise ValueError(f"{symbol} 名册为空或缺少必要字段")
+        total = int((payload.get("pageHelp") or {}).get("total", len(raw)))
+        if total > len(raw):
+            raise ValueError(f"{symbol} 名册被截断: {len(raw)}/{total}")
+        industry_code = raw["CSRC_CODE"].fillna("").astype(str).str.strip()
+        industry_name = raw["CSRC_CODE_DESC"].fillna("").astype(str).str.strip()
+        if (industry_code.eq("") | industry_name.eq("")).any():
+            raise ValueError(f"{symbol} 名册存在空行业")
+        return pd.DataFrame({
+            "证券代码": raw["A_STOCK_CODE"],
+            "证券简称": raw["SEC_NAME_CN"],
+            "上市日期": raw["LIST_DATE"],
+            "所属行业": industry_code + " " + industry_name,
+        })
 
     @staticmethod
     def _parse_ak_date(v) -> date | None:
@@ -176,43 +222,49 @@ class AkShareAdapter:
         return None
 
     def sync_stock_list(self, patient: bool = False) -> int:
-        """Survivorship-free A-share roster from akshare (free, no token): SH/SZ/BJ
-        listed + SH/SZ delisted, each with a real list_date (delisted also carry
-        delist_date). Each source is best-effort (one flaky endpoint won't abort
-        the rest), retried on network blips. `patient` accepted for adapter-
-        signature parity (akshare isn't point-tiered). Returns stocks saved."""
-        count = 0
-        for fn_name, c_code, c_name, c_list, c_delist, exch, c_ind in self._ROSTER_SOURCES:
-            fn = getattr(ak, fn_name, None)
+        """Refresh complete rosters before writing; return unique saved codes."""
+        pending = []
+        for fn_name, kwargs, c_code, c_name, c_list, c_delist, exch, c_ind in self._ROSTER_SOURCES:
+            fn = (self._fetch_sh_stock_list if fn_name == "stock_info_sh_name_code"
+                  else getattr(ak, fn_name, None))
             if fn is None:
-                continue
-            df = None
+                raise RuntimeError(f"名册接口不存在: {fn_name}")
+            # AkShare caches some rosters for the life of the server process.
+            cache_clear = getattr(fn, "cache_clear", None)
+            if callable(cache_clear):
+                cache_clear()
             for attempt in range(1, MAX_RETRIES + 1):
                 try:
-                    df = fn()
+                    df = fn(**kwargs)
                     break
-                except Exception as e:  # noqa: BLE001 - upstream blip → retry/skip
-                    logger.warning("%s attempt %d/%d: %s",
-                                   fn_name, attempt, MAX_RETRIES, e)
-                    if attempt < MAX_RETRIES:
-                        time.sleep(RETRY_DELAY * attempt)
-            if df is None or df.empty or c_code not in df.columns:
-                logger.warning("roster source %s unavailable/changed — skipped", fn_name)
-                continue
-            for _, r in df.iterrows():
-                code = str(r.get(c_code, "")).strip()
-                if not code.isdigit():
-                    continue  # skip headers/junk; A-share codes are all digits
-                list_date = self._parse_ak_date(r.get(c_list)) or date(2000, 1, 1)
-                delist_date = self._parse_ak_date(r.get(c_delist)) if c_delist else None
-                industry = str(r.get(c_ind) or "") if c_ind else ""
-                try:
-                    self._db.upsert_stock(code, str(r.get(c_name) or code), exch,
-                                          list_date, industry, delist_date=delist_date)
-                    count += 1
-                except Exception as e:  # noqa: BLE001 - one bad row shouldn't abort
-                    logger.warning("Failed to save %s: %s", code, e)
-        logger.info("akshare roster: %d 只(SH/SZ/BJ 在市 + SH/SZ 退市)", count)
+                except Exception as exc:
+                    if attempt == MAX_RETRIES:
+                        raise RuntimeError(f"名册获取失败: {fn_name} {kwargs}") from exc
+                    time.sleep(RETRY_DELAY * attempt)
+            required = {c_code, c_name, c_list}
+            if c_delist:
+                required.add(c_delist)
+            if c_ind:
+                required.add(c_ind)
+            if df is None or df.empty or not required.issubset(df.columns):
+                raise ValueError(f"名册为空或缺少必要字段: {fn_name} {kwargs}")
+            for _, row in df.iterrows():
+                code = str(row[c_code]).strip()
+                name = "" if pd.isna(row[c_name]) else str(row[c_name]).strip()
+                listed = self._parse_ak_date(row[c_list])
+                if len(code) != 6 or not code.isdigit() or not name or listed is None:
+                    raise ValueError(f"名册存在无效代码、名称或上市日期: {fn_name}")
+                delisted = self._parse_ak_date(row[c_delist]) if c_delist else None
+                if c_delist and delisted is None:
+                    raise ValueError(f"退市记录缺少有效退市日期: {fn_name} {code}")
+                value = row[c_ind] if c_ind else None
+                industry = "" if pd.isna(value) else str(value).strip()
+                pending.append((code, name, exch, listed, industry, delisted))
+        # Source failures above leave the existing roster intact.
+        for record in pending:
+            self._db.upsert_stock(*record)
+        count = len({record[0] for record in pending})
+        logger.info("akshare roster: %d unique stocks (SH main/STAR/SZ/BJ + delisted)", count)
         return count
 
     # --- Data sources ---
