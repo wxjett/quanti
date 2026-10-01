@@ -106,8 +106,34 @@ export const syncQuotesAsync = (opts: SyncOpts = {}) =>
 export const fetchQuotesSyncStatus = (jobId: string) =>
   api.get<SyncStatus>(`/sync/quotes/status`, { params: { job_id: jobId } });
 
+export interface StockPoolSyncStage {
+  list_status: "L" | "D" | "P";
+  label: string;
+  status: "pending" | "running" | "success" | "error" | "skipped";
+  planned_at: string;
+  requested_at: string | null;
+  finished_at: string | null;
+  count: number;
+  error: string;
+}
+
+export interface StockPoolSyncStatus {
+  job_id: string | null;
+  source: string | null;
+  status: "idle" | "waiting" | "running" | "done" | "error";
+  active: boolean;
+  synced: number;
+  error: string;
+  last_requested_at: string | null;
+  stages: StockPoolSyncStage[];
+}
+
 export const syncStockList = () =>
-  api.post<{ synced: number; message: string }>("/sync/stocks");
+  api.post<(StockPoolSyncStatus & { message: string }) |
+    { synced: number; message: string; error?: string }>("/sync/stocks");
+
+export const fetchStockPoolSyncStatus = () =>
+  api.get<StockPoolSyncStatus>("/sync/stocks/status", { timeout: 15_000 });
 
 // --- Background quote syncer (continuous daemon, decoupled from agent tick) ---
 export interface BackgroundSyncStatus {

@@ -200,10 +200,35 @@
           <span v-if="syncingAll" class="spinner dark" />
           {{ syncingAll ? "同步中..." : "下载K线" }}
         </button>
-        <button class="btn-pool" @click="syncFullPool" :disabled="syncingPool">
-          <span v-if="syncingPool" class="spinner dark" />
-          {{ syncingPool ? "同步中..." : "同步全A股池" }}
+        <button class="btn-pool" @click="syncFullPool" :disabled="syncingPool || poolStarting || !poolStatusReady">
+          <span v-if="syncingPool || poolStarting" class="spinner dark" />
+          {{ syncingPool || poolStarting ? "同步中..." : "同步全A股池" }}
         </button>
+      </div>
+      <div
+        v-if="poolMessage || poolSync?.job_id || poolPollError"
+        class="bg-sync-bar pool-sync-bar"
+        :class="{ 'bg-sync-paused': poolSync?.status === 'waiting', 'pool-sync-error': poolMessageError || (!poolMessage && poolSync?.status === 'error') }"
+      >
+        <template v-if="poolMessage">
+          <div class="bg-sync-row">
+            <span class="bg-sync-label">股票池同步 · <strong>{{ poolMessageError ? '失败' : '已完成' }}</strong></span>
+          </div>
+          <div :class="poolMessageError ? 'bg-sync-error' : 'pool-sync-detail'">{{ poolMessage }}</div>
+        </template>
+        <template v-else-if="poolSync?.job_id">
+          <div class="bg-sync-row">
+            <span class="bg-sync-label">股票池同步 · <strong>{{ poolSyncStateLabel }}</strong></span>
+            <span class="bg-sync-stats">
+              已同步 {{ poolSync.synced }} · 失败 {{ poolFailed }} · 队列剩余 {{ poolRemaining }}
+            </span>
+          </div>
+          <div v-if="poolExecuted" class="pool-sync-detail">已执行：{{ poolExecuted }}</div>
+          <div v-if="poolPending" class="pool-sync-detail">待执行：{{ poolPending }}</div>
+          <div v-if="poolSkipped" class="pool-sync-detail">不再执行：{{ poolSkipped }}</div>
+          <div v-if="poolSync.error" class="bg-sync-error">错误：{{ poolSync.error }}</div>
+        </template>
+        <div v-if="poolPollError" class="bg-sync-error">{{ poolPollError }}</div>
       </div>
       <div v-if="syncMsg" class="sync-msg" :class="syncError ? 'error' : 'success'">
         {{ syncMsg }}
@@ -303,6 +328,7 @@ import {
   fetchStockStats,
   syncQuotes,
   syncStockList,
+  fetchStockPoolSyncStatus,
   syncQuotesAsync,
   fetchQuotesSyncStatus,
   fetchBackgroundSyncStatus,
@@ -317,6 +343,7 @@ import {
   type AlertConfig,
   type StockInfo,
   type StockPoolStats,
+  type StockPoolSyncStatus,
   type SyncStatus,
   type BackgroundSyncStatus,
   type DataSourceConfig,
@@ -328,6 +355,69 @@ const addInput = ref("");
 const syncing = ref(false);
 const syncingAll = ref(false);
 const syncingPool = ref(false);
+const poolStarting = ref(false);
+const poolStatusReady = ref(false);
+const poolSync = ref<StockPoolSyncStatus | null>(null);
+const poolMessage = ref("");
+const poolMessageError = ref(false);
+const poolPollError = ref("");
+let poolSyncTimer: ReturnType<typeof setInterval> | null = null;
+let poolPolling = false;
+let poolRequestVersion = 0;
+
+const poolSyncStateLabel = computed(() => {
+  const labels = { idle: "未开始", waiting: "等待下一次请求", running: "正在请求", done: "已完成", error: "失败" };
+  return poolSync.value ? labels[poolSync.value.status] : "未开始";
+});
+const poolFailed = computed(() => poolSync.value?.stages.filter(s => s.status === "error").length ?? 0);
+const poolRemaining = computed(() => poolSync.value?.stages.filter(s => s.status === "pending").length ?? 0);
+function poolTime(value: string | null): string {
+  if (!value) return "未请求";
+  return new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "Asia/Shanghai", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+  }).format(new Date(value));
+}
+const poolExecuted = computed(() => (poolSync.value?.stages ?? [])
+  .filter(s => s.requested_at)
+  .map(s => `${poolTime(s.requested_at)} 请求${s.label} — ${s.status === "success" ? `成功，${s.count}只` : s.status === "error" ? "失败" : "请求中"}`)
+  .join("；"));
+const poolPending = computed(() => (poolSync.value?.stages ?? [])
+  .filter(s => s.status === "pending")
+  .map(s => `${poolTime(s.planned_at)} 请求${s.label}`).join("；"));
+const poolSkipped = computed(() => (poolSync.value?.stages ?? [])
+  .filter(s => s.status === "skipped").map(s => s.label).join("；"));
+
+async function refreshStockPoolSync() {
+  if (poolPolling || poolStarting.value) return;
+  poolPolling = true;
+  const requestVersion = poolRequestVersion;
+  try {
+    const previous = poolSync.value;
+    const { data } = await fetchStockPoolSyncStatus();
+    // A poll started before POST must not overwrite the new task's state.
+    if (requestVersion !== poolRequestVersion) return;
+    poolSync.value = data;
+    syncingPool.value = data.active;
+    poolStatusReady.value = true;
+    poolPollError.value = "";
+    if (data.active) {
+      poolMessage.value = "";
+      poolMessageError.value = false;
+    }
+    if (previous && previous.job_id === data.job_id &&
+        (data.synced > previous.synced || (previous.active && !data.active))) {
+      await loadStocks();
+    }
+  } catch {
+    if (requestVersion !== poolRequestVersion) return;
+    // Unknown server state must not unlock the button after a lost connection.
+    poolStatusReady.value = false;
+    poolPollError.value = "无法获取股票池同步状态，请检查服务连接；恢复后将重新获取进度";
+  } finally {
+    poolPolling = false;
+  }
+}
 
 // 股票列表只取一页:全 A 股 5,900+ 行一次性渲染会造出 6.5 万个 DOM 节点、
 // 每次进页面 ~1.1s 主线程布局(实测),整页连同鼠标都会卡。搜索 + 翻页覆盖
@@ -558,6 +648,8 @@ async function resumeSync() {
 }
 
 onMounted(async () => {
+  poolSyncTimer = setInterval(refreshStockPoolSync, 5_000);
+  await refreshStockPoolSync();
   await loadStocks();
   await loadDataSource();
   await loadAlertConfig();
@@ -568,6 +660,10 @@ onMounted(async () => {
 });
 
 onUnmounted(() => {
+  if (poolSyncTimer) {
+    clearInterval(poolSyncTimer);
+    poolSyncTimer = null;
+  }
   if (bgSyncTimer) {
     clearInterval(bgSyncTimer);
     bgSyncTimer = null;
@@ -621,19 +717,28 @@ async function loadStocks() {
 }
 
 async function syncFullPool() {
-  syncingPool.value = true;
-  syncMsg.value = "";
-  syncError.value = false;
+  if (syncingPool.value || poolStarting.value || !poolStatusReady.value) return;
+  poolRequestVersion += 1;
+  poolStarting.value = true;
+  poolMessage.value = "";
+  poolMessageError.value = false;
   try {
     const res = await syncStockList();
-    syncMsg.value = res.data.message;
-    syncError.value = false;
-    await loadStocks();
+    poolStatusReady.value = true;
+    poolPollError.value = "";
+    if ("stages" in res.data) {
+      poolSync.value = res.data;
+      syncingPool.value = res.data.active;
+    } else {
+      poolMessage.value = res.data.message;
+      poolMessageError.value = Boolean(res.data.error);
+      await loadStocks();
+    }
   } catch (e) {
-    syncMsg.value = "同步全A股池失败，请检查网络";
-    syncError.value = true;
+    poolStatusReady.value = false;
+    poolPollError.value = "同步请求状态未知，请检查服务连接；恢复后将重新获取任务状态";
   } finally {
-    syncingPool.value = false;
+    poolStarting.value = false;
   }
 }
 
@@ -1294,6 +1399,17 @@ tbody tr:last-child td {
 .bg-sync-bar.bg-sync-paused {
   background: rgba(245, 158, 11, 0.07);
   border-left-color: rgba(245, 158, 11, 0.6);
+}
+.pool-sync-bar {
+  margin: 12px 0 0;
+}
+.pool-sync-bar.pool-sync-error {
+  background: rgba(185, 28, 28, 0.06);
+  border-left-color: rgba(185, 28, 28, 0.5);
+}
+.pool-sync-detail {
+  margin-top: 6px;
+  color: var(--color-text-secondary);
 }
 .bg-sync-row {
   display: flex;

@@ -15,6 +15,7 @@ from quanti.agent.runtime import AgentRuntime
 from quanti.data.background_sync import BackgroundQuoteSyncer
 from quanti.data.database import Database
 from quanti.data.provider import DataProvider
+from quanti.data.stock_pool_sync import StockPoolSync
 from quanti.execution.factory import make_broker
 from quanti.utils.jsonsafe import json_safe
 
@@ -269,8 +270,11 @@ def create_app(
                                     provider=provider,
                                     heavy_warmup_sec=_warmup)
 
+    stock_pool_sync = StockPoolSync(db)
+
     @asynccontextmanager
     async def _lifespan(_app: FastAPI):
+        stock_pool_sync.recover()
         from quanti.agent.goal import load_goal
         try:
             goal = load_goal(db)
@@ -293,6 +297,8 @@ def create_app(
             except Exception:
                 pass
         yield
+        import asyncio
+        await asyncio.to_thread(stock_pool_sync.shutdown)
         # Process shutdown — halt the thread but do NOT flip the goal back
         # to disabled, otherwise the agent would never auto-resume across
         # server restarts. User-driven stop goes through agent.stop().
@@ -323,6 +329,7 @@ def create_app(
     app.state.broker = broker
     app.state.agent = agent
     app.state.bg_sync = bg_sync
+    app.state.stock_pool_sync = stock_pool_sync
 
     from quanti.api.routes import router
 

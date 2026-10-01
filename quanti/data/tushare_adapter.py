@@ -206,26 +206,49 @@ class TushareAdapter:
                 pro.stock_basic, list_status=status,
                 fields="ts_code,name,industry,list_date,delist_date",
                 _patient=patient)
-            if df is None or df.empty:
-                continue
-            for _, row in df.iterrows():
-                code, exchange = self._ts_code_to_code(str(row["ts_code"]))
-                list_date = self._parse_ts_date(row.get("list_date"))
-                if list_date is None:
-                    continue  # list_date is NOT NULL in schema; skip junk rows
-                delist_date = self._parse_ts_date(row.get("delist_date"))
-                # stock_basic carries an `industry` field even on low tiers; keep
-                # it so factor industry-neutralization isn't a no-op. Delisted (D)
-                # rows often have a blank industry — upsert_stock's COALESCE then
-                # preserves any industry already on the row.
-                industry = str(row.get("industry") or "")
-                try:
-                    self._db.upsert_stock(
-                        code, str(row["name"]), exchange, list_date,
-                        industry=industry, delist_date=delist_date)
-                    count += 1
-                except Exception as e:  # noqa: BLE001 - one bad row shouldn't abort
-                    logger.warning("save %s failed: %s", code, e)
+            count += self._save_stock_list(df)
+        return count
+
+    def sync_stock_list_status(self, status: str, *, on_request=None) -> int:
+        """Sync one roster without retries; the dashboard schedules L/D/P.
+
+        on_request records the request time just before the upstream call.
+        Network and storage failures propagate so the task stops immediately.
+        """
+        if status not in ("L", "D", "P"):
+            raise ValueError(f"Unknown listing status: {status}")
+        pro = self._ensure_pro()
+        if on_request is not None:
+            on_request()
+        df = pro.stock_basic(
+            list_status=status,
+            fields="ts_code,name,industry,list_date,delist_date")
+        if df is None:
+            raise RuntimeError("stock_basic 未返回有效名单")
+        return self._save_stock_list(df, strict=True)
+
+    def _save_stock_list(self, df, *, strict: bool = False) -> int:
+        if df is None or df.empty:
+            return 0
+        count = 0
+        for _, row in df.iterrows():
+            code, exchange = self._ts_code_to_code(str(row["ts_code"]))
+            list_date = self._parse_ts_date(row.get("list_date"))
+            if list_date is None:
+                continue  # list_date is NOT NULL in schema; skip junk rows
+            delist_date = self._parse_ts_date(row.get("delist_date"))
+            # Empty industries on delisted rows preserve existing industries
+            # through upsert_stock, as in the original three-roster sync.
+            industry = str(row.get("industry") or "")
+            try:
+                self._db.upsert_stock(
+                    code, str(row["name"]), exchange, list_date,
+                    industry=industry, delist_date=delist_date)
+                count += 1
+            except Exception as e:  # noqa: BLE001
+                if strict:
+                    raise
+                logger.warning("save %s failed: %s", code, e)
         return count
 
     def sync_trade_calendar(self, year: int | None = None) -> int:
