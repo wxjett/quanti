@@ -175,6 +175,7 @@ async def _run_quotes_sync(job_id: str, codes: list[str], db,
     from quanti.data.source import try_make_quote_adapter
     from quanti.data.integrity import (check_quote_completeness,
                                        expected_trading_days)
+    from quanti.data.tushare_adapter import TushareAdapter
     import asyncio
     from functools import partial
 
@@ -185,6 +186,10 @@ async def _run_quotes_sync(job_id: str, codes: list[str], db,
         db.update_sync_job(job_id, 0, "error", {"_source": src_err})
         return
     # Window-level calendar lookup once, reused for every code's completeness.
+    daily_request_opts = (
+        {"daily_request_delay_seconds": 1.5}
+        if isinstance(adapter, TushareAdapter) else {}
+    )
     exp_days, used_cal = expected_trading_days(db, start_d, end_d)
     errors: dict[str, str] = {}
     warnings: dict[str, str] = {}
@@ -193,7 +198,8 @@ async def _run_quotes_sync(job_id: str, codes: list[str], db,
     for i, code in enumerate(codes):
         try:
             fn = partial(adapter.sync_daily_quotes, code, start=start_d,
-                         end=end_d, repair_gaps=False, with_basic=with_basic)
+                         end=end_d, repair_gaps=False, with_basic=with_basic,
+                         **daily_request_opts)
             count = await loop.run_in_executor(None, fn)
             if count == 0:
                 errors[code] = "未获取到数据"

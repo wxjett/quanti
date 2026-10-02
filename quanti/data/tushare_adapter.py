@@ -174,6 +174,7 @@ class TushareAdapter:
         # callers (CLI/backfill) where a slow token (e.g. stock_basic 1/min) is
         # worth waiting for; API stays non-patient so it fails fast + clean.
         patient = kwargs.pop("_patient", False)
+        request_delay = kwargs.pop("_request_delay_seconds", 0.0)
         last_err: Exception | None = None
         for attempt in range(1, MAX_RETRIES + 1):
             try:
@@ -188,6 +189,9 @@ class TushareAdapter:
                         time.sleep(RATE_LIMIT_WAIT)   # let the 1-min window reset
                     else:
                         time.sleep(RETRY_DELAY * attempt)
+            finally:
+                if request_delay:
+                    time.sleep(request_delay)
         if last_err is not None:
             raise last_err
         return None
@@ -270,7 +274,8 @@ class TushareAdapter:
     def sync_daily_quotes(self, code: str, start: date | None = None,
                           end: date | None = None,
                           repair_gaps: bool = True,
-                          with_basic: bool = False) -> int:
+                          with_basic: bool = False,
+                          daily_request_delay_seconds: float = 0.0) -> int:
         """Fetch RAW daily bars for `code` (incremental from the last stored bar
         by default) and save them with a reconstructed adj_factor. ONE `daily`
         call (500/min) — no `adj_factor`/`pro_bar` call (rate-limited as low as
@@ -292,7 +297,9 @@ class TushareAdapter:
         pro = self._ensure_pro()
         ts_code = self._code_to_ts_code(code)
         sd, ed = start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
-        raw = self._retry(pro.daily, ts_code=ts_code, start_date=sd, end_date=ed)
+        raw = self._retry(
+            pro.daily, ts_code=ts_code, start_date=sd, end_date=ed,
+            _request_delay_seconds=daily_request_delay_seconds)
         if raw is None or raw.empty:
             return 0
 
