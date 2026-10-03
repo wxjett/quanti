@@ -237,16 +237,17 @@
     </div>
 
     <!-- Download Progress Bar -->
-    <div v-if="syncJobId && syncProgress.total > 0" class="progress-bar-wrap">
+    <div v-if="syncJobId" class="progress-bar-wrap">
       <div class="progress-info">
-        <span>已下载 {{ syncProgress.current }}/{{ syncProgress.total }}<span v-if="syncProgress.eta_seconds" class="progress-eta">，约剩 {{ Math.floor(syncProgress.eta_seconds / 60) }} 分钟</span></span>
+        <span>下载K线 · <strong>{{ quotesSyncStateLabel }}</strong><template v-if="syncProgress.total > 0"> · 已处理 {{ syncProgress.current }}/{{ syncProgress.total }}<span v-if="syncProgress.eta_seconds" class="progress-eta">，约剩 {{ Math.floor(syncProgress.eta_seconds / 60) }} 分钟</span></template></span>
         <span v-if="Object.keys(syncProgress.errors).length" class="progress-errors">
           {{ Object.keys(syncProgress.errors).length }} 只失败
         </span>
       </div>
-      <div class="progress-bar">
+      <div v-if="syncProgress.total > 0" class="progress-bar">
         <div class="progress-fill" :style="{ width: (syncProgress.current / syncProgress.total * 100) + '%' }"></div>
       </div>
+      <div v-if="syncStatusError" class="bg-sync-error">{{ syncStatusError }}</div>
     </div>
 
     <div class="card">
@@ -452,8 +453,14 @@ watch([syncYears, syncWithBasic, syncWithFinancials], () => {
 const syncMsg = ref("");
 const syncError = ref(false);
 const syncingCodes = reactive(new Set<string>());
+const quotesJobStorageKey = "quanti.quotesSyncJobId";
 const syncJobId = ref<string | null>(null);
 const syncProgress = ref<SyncStatus>({ job_id: "", current: 0, total: 0, status: "", errors: {}, message: "", eta_seconds: null });
+const syncStatusError = ref("");
+const quotesSyncStateLabel = computed(() => {
+  const labels: Record<string, string> = { running: "运行中", done: "已完成", error: "已结束（有失败）" };
+  return labels[syncProgress.value.status] ?? "正在读取状态";
+});
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 
 // Background syncer state (polled every 10s while the page is open).
@@ -649,6 +656,16 @@ async function resumeSync() {
 }
 
 onMounted(async () => {
+  // 恢复链接供修复前已启动的任务使用；之后由浏览器保存最近任务编号。
+  const recoveryUrl = new URL(window.location.href);
+  const jobId = recoveryUrl.searchParams.get("quotes_sync_job") || localStorage.getItem(quotesJobStorageKey);
+  if (jobId) {
+    startPolling(jobId);
+    if (recoveryUrl.searchParams.has("quotes_sync_job")) {
+      recoveryUrl.searchParams.delete("quotes_sync_job");
+      window.history.replaceState(window.history.state, "", recoveryUrl);
+    }
+  }
   poolSyncTimer = setInterval(refreshStockPoolSync, 5_000);
   await refreshStockPoolSync();
   await loadStocks();
@@ -661,6 +678,7 @@ onMounted(async () => {
 });
 
 onUnmounted(() => {
+  stopPolling();
   if (poolSyncTimer) {
     clearInterval(poolSyncTimer);
     poolSyncTimer = null;
@@ -797,21 +815,37 @@ async function syncOne(code: string) {
 }
 
 function startPolling(jobId: string) {
+  stopPolling();
   syncJobId.value = jobId;
-  pollTimer = setInterval(async () => {
+  localStorage.setItem(quotesJobStorageKey, jobId);
+  syncingAll.value = true;
+  syncing.value = true;
+  let polling = false;
+  const updateProgress = async () => {
+    if (polling) return;
+    polling = true;
     try {
       const res = await fetchQuotesSyncStatus(jobId);
+      if (res.data.job_id !== jobId) throw new Error("下载任务状态不可用");
       syncProgress.value = res.data;
+      syncStatusError.value = "";
       if (res.data.status !== "running") {
         stopPolling();
-        await loadStocks();
+        syncingAll.value = false;
+        syncing.value = false;
         syncMsg.value = res.data.message;
         syncError.value = res.data.status === "error";
+        await loadStocks();
       }
     } catch (e) {
+      syncStatusError.value = "无法获取下载进度，正在重试；请勿重复启动下载";
       console.error("Poll error:", e);
+    } finally {
+      polling = false;
     }
-  }, 1000);
+  };
+  pollTimer = setInterval(updateProgress, 1000);
+  void updateProgress();
 }
 
 function stopPolling() {
@@ -819,22 +853,21 @@ function stopPolling() {
     clearInterval(pollTimer);
     pollTimer = null;
   }
-  syncJobId.value = null;
 }
 
 async function syncAll() {
   // 下载K线是整库任务(后端不传 codes 就同步全部),跟当前页/搜索结果无关。
-  if ((poolStats.value?.total ?? 0) === 0) return;
+  if (syncingAll.value || (poolStats.value?.total ?? 0) === 0) return;
   syncingAll.value = true;
   syncing.value = true;
   syncMsg.value = "";
   syncError.value = false;
-  syncProgress.value = { job_id: "", current: 0, total: 0, status: "running", errors: {}, message: "启动中...", eta_seconds: null };
+  syncStatusError.value = "";
   try {
     const res = await syncQuotesAsync(syncOpts());
-    if (res.data.job_id) {
-      startPolling(res.data.job_id);
-    }
+    if (!res.data.job_id) throw new Error("未返回下载任务编号");
+    syncProgress.value = { job_id: res.data.job_id, current: 0, total: 0, status: "running", errors: {}, message: "启动中...", eta_seconds: null };
+    startPolling(res.data.job_id);
   } catch (e) {
     syncMsg.value = "同步启动失败";
     syncError.value = true;
