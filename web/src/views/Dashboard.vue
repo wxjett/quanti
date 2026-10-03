@@ -174,13 +174,14 @@
     </div>
 
     <div
-      v-if="poolMessage || poolSync?.job_id || poolPollError"
+      v-if="poolSyncVisible"
       class="bg-sync-bar pool-sync-bar"
       :class="{ 'bg-sync-paused': poolSync?.status === 'waiting', 'pool-sync-error': poolMessageError || (!poolMessage && poolSync?.status === 'error') }"
     >
       <template v-if="poolMessage">
         <div class="bg-sync-row">
           <span class="bg-sync-label">股票池同步 · <strong>{{ poolMessageError ? '失败' : '已完成' }}</strong></span>
+          <button v-if="poolCanClose" class="btn-link" @click="closePoolSync">关闭</button>
         </div>
         <div :class="poolMessageError ? 'bg-sync-error' : 'pool-sync-detail'">{{ poolMessage }}</div>
       </template>
@@ -190,6 +191,7 @@
           <span class="bg-sync-stats">
             已同步 {{ poolSync.synced }} · 失败 {{ poolFailed }} · 队列剩余 {{ poolRemaining }}
           </span>
+          <button v-if="poolCanClose" class="btn-link" @click="closePoolSync">关闭</button>
         </div>
         <div v-if="poolExecuted" class="pool-sync-detail">已执行：{{ poolExecuted }}</div>
         <div v-if="poolPending" class="pool-sync-detail">待执行：{{ poolPending }}</div>
@@ -360,12 +362,45 @@ const syncingPool = ref(false);
 const poolStarting = ref(false);
 const poolStatusReady = ref(false);
 const poolSync = ref<StockPoolSyncStatus | null>(null);
-const poolMessage = ref("");
-const poolMessageError = ref(false);
+const dismissedPoolKey = "quanti.dismissedStockPoolJobId";
+const poolMessageKey = "quanti.stockPoolResultMessage";
+const dismissedPoolId = ref(localStorage.getItem(dismissedPoolKey) ?? "");
+let savedPoolMessage: { id: string; message: string; error: boolean; previousJobId: string | null } | null = null;
+try {
+  savedPoolMessage = JSON.parse(localStorage.getItem(poolMessageKey) || "null");
+} catch { /* 忽略损坏的浏览器缓存，仍从服务读取任务状态。 */ }
+const poolMessage = ref(savedPoolMessage?.message ?? "");
+const poolMessageError = ref(savedPoolMessage?.error ?? false);
+const poolMessageId = ref(savedPoolMessage?.id ?? "");
+const poolMessagePreviousJobId = ref<string | null>(savedPoolMessage?.previousJobId ?? null);
 const poolPollError = ref("");
 let poolSyncTimer: ReturnType<typeof setInterval> | null = null;
 let poolPolling = false;
 let poolRequestVersion = 0;
+
+const poolDisplayId = computed(() => poolMessage.value ? poolMessageId.value : poolSync.value?.job_id ?? "");
+const poolSyncVisible = computed(() => {
+  if (poolPollError.value || poolSync.value?.active) return true;
+  return Boolean(poolDisplayId.value) && poolDisplayId.value !== dismissedPoolId.value;
+});
+const poolCanClose = computed(() => {
+  if (!poolStatusReady.value || poolStarting.value || syncingPool.value || poolSync.value?.active || poolPollError.value) return false;
+  return Boolean(poolDisplayId.value) && (Boolean(poolMessage.value) || poolSync.value?.status === "done" || poolSync.value?.status === "error");
+});
+
+function closePoolSync() {
+  if (!poolCanClose.value) return;
+  dismissedPoolId.value = poolDisplayId.value;
+  localStorage.setItem(dismissedPoolKey, dismissedPoolId.value);
+}
+
+function clearPoolMessage() {
+  poolMessage.value = "";
+  poolMessageError.value = false;
+  poolMessageId.value = "";
+  poolMessagePreviousJobId.value = null;
+  localStorage.removeItem(poolMessageKey);
+}
 
 const poolSyncStateLabel = computed(() => {
   const labels = { idle: "未开始", waiting: "等待下一次请求", running: "正在请求", done: "已完成", error: "失败" };
@@ -403,9 +438,8 @@ async function refreshStockPoolSync() {
     syncingPool.value = data.active;
     poolStatusReady.value = true;
     poolPollError.value = "";
-    if (data.active) {
-      poolMessage.value = "";
-      poolMessageError.value = false;
+    if (data.active || (poolMessage.value && data.job_id !== poolMessagePreviousJobId.value)) {
+      clearPoolMessage();
     }
     if (previous && previous.job_id === data.job_id &&
         (data.synced > previous.synced || (previous.active && !data.active))) {
@@ -739,8 +773,7 @@ async function syncFullPool() {
   if (syncingPool.value || poolStarting.value || !poolStatusReady.value) return;
   poolRequestVersion += 1;
   poolStarting.value = true;
-  poolMessage.value = "";
-  poolMessageError.value = false;
+  clearPoolMessage();
   try {
     const res = await syncStockList();
     poolStatusReady.value = true;
@@ -751,6 +784,12 @@ async function syncFullPool() {
     } else {
       poolMessage.value = res.data.message;
       poolMessageError.value = Boolean(res.data.error);
+      poolMessageId.value = `message_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+      poolMessagePreviousJobId.value = poolSync.value?.job_id ?? null;
+      localStorage.setItem(poolMessageKey, JSON.stringify({
+        id: poolMessageId.value, message: poolMessage.value,
+        error: poolMessageError.value, previousJobId: poolMessagePreviousJobId.value,
+      }));
       await loadStocks();
     }
   } catch (e) {
