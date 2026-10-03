@@ -173,6 +173,32 @@
       <div v-if="bgSync.last_error" class="bg-sync-error">最近错误: {{ bgSync.last_error }}</div>
     </div>
 
+    <div
+      v-if="poolMessage || poolSync?.job_id || poolPollError"
+      class="bg-sync-bar pool-sync-bar"
+      :class="{ 'bg-sync-paused': poolSync?.status === 'waiting', 'pool-sync-error': poolMessageError || (!poolMessage && poolSync?.status === 'error') }"
+    >
+      <template v-if="poolMessage">
+        <div class="bg-sync-row">
+          <span class="bg-sync-label">股票池同步 · <strong>{{ poolMessageError ? '失败' : '已完成' }}</strong></span>
+        </div>
+        <div :class="poolMessageError ? 'bg-sync-error' : 'pool-sync-detail'">{{ poolMessage }}</div>
+      </template>
+      <template v-else-if="poolSync?.job_id">
+        <div class="bg-sync-row">
+          <span class="bg-sync-label">股票池同步 · <strong>{{ poolSyncStateLabel }}</strong></span>
+          <span class="bg-sync-stats">
+            已同步 {{ poolSync.synced }} · 失败 {{ poolFailed }} · 队列剩余 {{ poolRemaining }}
+          </span>
+        </div>
+        <div v-if="poolExecuted" class="pool-sync-detail">已执行：{{ poolExecuted }}</div>
+        <div v-if="poolPending" class="pool-sync-detail">待执行：{{ poolPending }}</div>
+        <div v-if="poolSkipped" class="pool-sync-detail">不再执行：{{ poolSkipped }}</div>
+        <div v-if="poolSync.error" class="bg-sync-error">错误：{{ poolSync.error }}</div>
+      </template>
+      <div v-if="poolPollError" class="bg-sync-error">{{ poolPollError }}</div>
+    </div>
+
     <!-- Add Stock -->
     <div class="card add-card">
       <div class="add-row">
@@ -204,31 +230,6 @@
           <span v-if="syncingPool || poolStarting" class="spinner dark" />
           {{ syncingPool || poolStarting ? "同步中..." : "同步全A股池" }}
         </button>
-      </div>
-      <div
-        v-if="poolMessage || poolSync?.job_id || poolPollError"
-        class="bg-sync-bar pool-sync-bar"
-        :class="{ 'bg-sync-paused': poolSync?.status === 'waiting', 'pool-sync-error': poolMessageError || (!poolMessage && poolSync?.status === 'error') }"
-      >
-        <template v-if="poolMessage">
-          <div class="bg-sync-row">
-            <span class="bg-sync-label">股票池同步 · <strong>{{ poolMessageError ? '失败' : '已完成' }}</strong></span>
-          </div>
-          <div :class="poolMessageError ? 'bg-sync-error' : 'pool-sync-detail'">{{ poolMessage }}</div>
-        </template>
-        <template v-else-if="poolSync?.job_id">
-          <div class="bg-sync-row">
-            <span class="bg-sync-label">股票池同步 · <strong>{{ poolSyncStateLabel }}</strong></span>
-            <span class="bg-sync-stats">
-              已同步 {{ poolSync.synced }} · 失败 {{ poolFailed }} · 队列剩余 {{ poolRemaining }}
-            </span>
-          </div>
-          <div v-if="poolExecuted" class="pool-sync-detail">已执行：{{ poolExecuted }}</div>
-          <div v-if="poolPending" class="pool-sync-detail">待执行：{{ poolPending }}</div>
-          <div v-if="poolSkipped" class="pool-sync-detail">不再执行：{{ poolSkipped }}</div>
-          <div v-if="poolSync.error" class="bg-sync-error">错误：{{ poolSync.error }}</div>
-        </template>
-        <div v-if="poolPollError" class="bg-sync-error">{{ poolPollError }}</div>
       </div>
       <div v-if="syncMsg" class="sync-msg" :class="syncError ? 'error' : 'success'">
         {{ syncMsg }}
@@ -1401,7 +1402,7 @@ tbody tr:last-child td {
   border-left-color: rgba(245, 158, 11, 0.6);
 }
 .pool-sync-bar {
-  margin: 12px 0 0;
+  margin: 0 0 16px;
 }
 .pool-sync-bar.pool-sync-error {
   background: rgba(185, 28, 28, 0.06);
